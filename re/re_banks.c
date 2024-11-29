@@ -21,20 +21,22 @@
 
 #define SOCKET 3
 int active_channels[] = {0, 3};
-#define NUM_CHANNELS 2 
+#define NUM_CHANNELS 2
 #define NUM_RANKS 2 // Number of ranks per-channel
 #define NUM_BANKS 16 // Number of banks per-rank
 #define NUM_IMC_CTRS 4
-#define NUM_REQUESTS 100000
-#define REQ_THRESH 0.9
+#define NUM_REQUESTS 1000
+#define REQ_THRESH 0.8
+#define MIN_REQ_FRAC 0.1
 
 #define MAP_HUGE_1GB (30 << MAP_HUGE_SHIFT)
-#define BUF_SIZE 1024UL*1024UL // should be less than 1G
+#define BUF_SIZE 1024UL*1024UL*1024UL // should be less than or equal to 1G
 #define CL_SIZE 64
 
-#define WR_CAS_RANK_BASE 0x004000b8 // rank 0: b8, rank 1: b9 
+#define WR_CAS_RANK_BASE 0x004000b8 // rank 0: b8, rank 1: b9
+#define CAS_COUNT_WR 0x00400c04
 
-unsigned int *mmconfig_ptr; // PCIe CFG space
+volatile unsigned int *mmconfig_ptr; // PCIe CFG space
 uint64_t imc_counts[NUM_CHANNELS][NUM_IMC_CTRS];
 uint64_t prev_imc_counts[NUM_CHANNELS][NUM_IMC_CTRS];
 
@@ -90,7 +92,27 @@ void prog_imc_ctrs(int rank, int bg) {
     for(c = 0; c < NUM_CHANNELS; c++) {
         for(counter = 0; counter < NUM_IMC_CTRS; counter++) {
             // event code is determined by rank number; umask is bank number
-            value = ((WR_CAS_RANK_BASE + rank) | (bg*NUM_IMC_CTRS + (counter << 8)));
+            value = ((WR_CAS_RANK_BASE + rank) | ((bg*NUM_IMC_CTRS + counter) << 8));
+
+            channel = active_channels[c];
+            bus = IMC_BUS_Socket[socket];
+            device = IMC_Device_Channel[channel];
+            function = IMC_Function_Channel[channel];
+            offset = IMC_PmonCtl_Offset[counter];
+            index = PCI_cfg_index(bus, device, function, offset);
+            mmconfig_ptr[index] = value;
+        }
+    }
+}
+
+void prog_imc_ctrs_debug() {
+    int bus, device, function, offset, imc, channel, subchannel, socket, rc, c, counter;
+    int banks_per_bg;
+    uint32_t index, value;
+    socket = SOCKET;
+    for(c = 0; c < NUM_CHANNELS; c++) {
+        for(counter = 0; counter < 1; counter++) {
+            value = CAS_COUNT_WR;
 
             channel = active_channels[c];
             bus = IMC_BUS_Socket[socket];
@@ -144,6 +166,26 @@ void get_max_imc_ctr(int *max_channel, int *max_ctr, uint64_t* max_val) {
     *max_val = mval;
 }
 
+uint64_t get_sum_imc_ctrs() {
+    int c, counter;
+    uint64_t res = 0;
+    for(c = 0; c < NUM_CHANNELS; c++) {
+        for(counter = 0; counter < NUM_IMC_CTRS; counter++) {
+            res += imc_counts[c][counter] - prev_imc_counts[c][counter];
+        }
+    }
+    return res;
+}
+
+void log_imc_ctrs() {
+    int c, counter;
+    for(c = 0; c < NUM_CHANNELS; c++) {
+        for(counter = 0; counter < NUM_IMC_CTRS; counter++) {
+            fprintf(stderr, "channel:%d, counter:%d, value:%lu\n", c, counter, imc_counts[c][counter] - prev_imc_counts[c][counter]);
+        }
+    }
+}
+
 void issue_requests(volatile char *p, int num_requests) {
     int i;
     __m512i val = _mm512_set_epi32(1995, 1995, 2002, 2002, 1995, 1995, 2002, 2002, 1995, 1995, 2002, 2002, 1995, 1995, 2002, 2002);
@@ -175,7 +217,7 @@ int main() {
             // then output bank mapping
     int channel, rank, bank, bg, num_bgs;
     int max_channel, max_ctr;
-    uint64_t max_val, num_hits;
+    uint64_t max_val, num_hits, sum_val;
     char *p;
     num_bgs = NUM_BANKS/NUM_IMC_CTRS;
     for(rank = 0; rank < NUM_RANKS; rank++) {
@@ -186,6 +228,7 @@ int main() {
 
             // program imc ctrs for a group of banks on each channel
             prog_imc_ctrs(rank, bg);
+            // prog_imc_ctrs_debug(rank, bg);
             for(p = a; p < a + BUF_SIZE; p += CL_SIZE) {
                 sample_imc_ctrs();
                 // Generate accesses
@@ -193,14 +236,21 @@ int main() {
                 // Measure bank counts
                 sample_imc_ctrs();
 
+                // debugging
+                // fprintf(stderr, "generated requests to address: 0x%08X\n", (unsigned int)((uintptr_t)p & 0x3FFFFFFF));
+                // log_imc_ctrs();
+
                 get_max_imc_ctr(&max_channel, &max_ctr, &max_val);
-                if(((double) max_val) >= (REQ_THRESH * NUM_REQUESTS)) {
+                sum_val = get_sum_imc_ctrs(); 
+                if((((double)sum_val) >= MIN_REQ_FRAC * NUM_REQUESTS) 
+                    && (((double) max_val) >= (REQ_THRESH * sum_val))) {
                     num_hits++;
                     uintptr_t paddr = (uintptr_t)p & 0x3FFFFFFF;
-                    fprintf(stdout, "0x%08X,%d,%d,%d,%d\n", (unsigned int) paddr, max_channel, rank, bg, max_ctr);
+                    fprintf(stdout, "0x%08X,%d,%d,%d,%d,%lu,%lu\n", (unsigned int) paddr, max_channel, rank, bg, max_ctr, sum_val, max_val);
                 }
             }
 
+            fflush(stdout);
             fprintf(stderr, "Pass completed: rank=%d, bg=%d, hits=%lu\n", rank, bg, num_hits);
         }
     }
