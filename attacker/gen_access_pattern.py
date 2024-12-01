@@ -83,5 +83,5 @@ if __name__ == "__main__":
             cl_addr = bank0_addrs[random.randrange(0, len(bank0_addrs))]
             # Compute address
             addr = slice_idx * slice_size + cl_addr
-            f.write('%d\n'%(addr))
+            f.write('%d\n'%(addr/CL_SIZE))
 

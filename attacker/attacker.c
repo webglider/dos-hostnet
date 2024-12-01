@@ -159,15 +159,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    fprintf(stderr, "loaded indices\n");
+
     // Allocate and intialize buffer
     int mmap_flags =  MAP_PRIVATE |  MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB;
-    size_t buf_size = ((WSS/align_sz))*align_sz;
+    size_t buf_size = WSS;
     a = NULL;
     a = mmap(0, buf_size, PROT_READ | PROT_WRITE, mmap_flags, -1, 0);
     if(a == NULL) {
         printf("mmap failed\n");
         return -1;
     }
+    fprintf(stderr, "mmap success\n");
     memset(a, 'm', buf_size);
 	printf("memset done\n");
 
