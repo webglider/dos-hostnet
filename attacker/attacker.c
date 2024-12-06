@@ -16,8 +16,8 @@
 #include <numaif.h>
 
 
-#define MAX_THREADS 8
-#define STATS_ITERATIONS 10
+#define MAX_THREADS 32
+#define STATS_ITERATIONS 131072
 
 #define WSS 17179869184ULL // 16 GiB
 
@@ -38,20 +38,23 @@ typedef struct {
     size_t local_hot_pages;
     int reset_mbind;
     _Atomic int finish;
+    uint64_t window;
 } ThreadArgs;
 
 void *thread_function(void *arg) {
     ThreadArgs *args = (ThreadArgs *)arg;
 
     // uint64_t x = 432437644 + args->thread_id;
-    uint64_t idx = args->idx;
+    uint64_t base_idx = args->idx;
+    uint64_t window = args->window;
+    uint64_t idx = 0;
     uint64_t count = 0, prev_count = 0;
     __m512i sum = _mm512_set_epi32(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     __m512i val = _mm512_set_epi32(1995, 1995, 2002, 2002, 1995, 1995, 2002, 2002, 1995, 1995, 2002, 2002, 1995, 1995, 2002, 2002);
     int i;
     while(count < 999999999999999ULL) {
         for(i = 0; i < STATS_ITERATIONS; i++) {
-            char *chunk = a + (((size_t)(indices[idx]))<<LOG_CL_SIZE);
+            char *chunk = a + (((size_t)(indices[base_idx + idx]))<<LOG_CL_SIZE);
             // printf("a: %p\n", a);
             // printf("chunk: %p\n", chunk);
             int k;
@@ -65,7 +68,8 @@ void *thread_function(void *arg) {
             #error "Define WORKLOAD"
             #endif
             count++;
-            idx = (idx + 1) & (num_samples - 1);
+            // idx = (idx + 1) & (num_samples/2 - 1);
+            idx = (idx + 1) % window;
         }
         atomic_store(args->count_ptr, count);
         if(atomic_load(&(args->finish))) {
@@ -112,17 +116,50 @@ void *thread_function(void *arg) {
     return NULL;
 }
 
+int* parse_cores(const char *input, int *num_cores) {
+    // Count the number of cores by counting commas
+    *num_cores = 1;
+    for (const char *p = input; *p; p++) {
+        if (*p == ',') (*num_cores)++;
+    }
+
+    // Allocate memory for the cores array
+    int *cores = malloc(*num_cores * sizeof(int));
+    if (!cores) {
+        perror("Failed to allocate memory");
+        return NULL;
+    }
+
+    // Parse the comma-separated string into the cores array
+    int index = 0;
+    char *input_copy = strdup(input);  // Duplicate the input string for strtok to modify
+    char *token = strtok(input_copy, ",");
+    while (token) {
+        cores[index++] = atoi(token);
+        token = strtok(NULL, ",");
+    }
+
+    free(input_copy);  // Free the duplicate string
+    return cores;
+}
+
 int main(int argc, char *argv[]) {
     size_t align_sz = 1ULL*1024ULL*1024ULL*1024ULL;
     setbuf(stdout, NULL);
-    int cores[8] = {3,7,11,15,19,23,27,31};
+    // int cores[8] = {3,7,11,15,19,23,27,31};
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s <num_threads> <nsamples> <address-trace>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <cores> <nsamples> <address-trace>\n", argv[0]);
         return 1;
     }
 
-    int num_threads = atoi(argv[1]);
-    if (num_threads <= 0 || num_threads > MAX_THREADS) {
+    int num_threads;
+    int *cores = parse_cores(argv[1], &num_threads);
+    if(cores == NULL) {
+        fprintf(stderr, "failed to parse core list\n");
+        return 1;
+    }
+
+    if (num_threads <= 0) {
         fprintf(stderr, "Number of threads invalid\n");
         return 1;
     }
@@ -184,6 +221,7 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < num_threads; ++i) {
         thread_args[i].thread_id = i;
         thread_args[i].idx = (num_samples/num_threads)*i;
+        thread_args[i].window = num_samples/num_threads;
         thread_args[i].buf_size = buf_size;
         thread_args[i].hot_size = 0;
         atomic_init(&thread_counts[i], 0);
